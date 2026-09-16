@@ -3,6 +3,7 @@ Enrichment and reasoning routes.
 """
 
 import asyncio
+import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -25,6 +26,7 @@ from ..schemas import (
 from ..session import GraphSession
 
 router = APIRouter(tags=["Enrichment"])
+logger = logging.getLogger(__name__)
 _FACT_RE = re.compile(r"^(?P<predicate>[A-Za-z_][\w:-]*)\((?P<args>.*)\)$")
 
 # SECURITY: Cap the candidate pool loaded by link prediction to prevent a
@@ -322,10 +324,11 @@ async def detect_duplicates(
         # a server-side contract break (issue #1592), not a bad request. Fail
         # loudly here instead of shipping rows the UI renders as 0% with empty
         # ids, which is how #1585 went unnoticed.
+        logger.exception("Dedup response violated the DuplicatePair contract")
         raise HTTPException(
             status_code=500,
             detail=f"Dedup response violated the DuplicatePair contract: {exc}",
-        )
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Dedup scan failed: {exc}")
 
