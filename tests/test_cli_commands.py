@@ -3150,6 +3150,113 @@ class TestBackup:
                 names = tar.getnames()
         assert "semantica-backup/graph/graph.db" in names
 
+    def test_create_reports_a_store_whose_path_is_missing(self, runner):
+        # Regression for #2009: a configured store whose path does not exist was
+        # dropped without a word, so the archive was partial and still reported
+        # success. The skip must be named, and recorded in the manifest.
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "missing_graph.json" in flat
+            with tarfile.open("out.tar.gz") as tar:
+                names = tar.getnames()
+                manifest = json.loads(
+                    tar.extractfile("semantica-backup/backup_manifest.json").read()
+                )
+        assert "semantica-backup/vector/index.json" in names
+        assert not any(n.startswith("semantica-backup/graph/") for n in names)
+        assert manifest["skipped"] == [
+            {"store": "graph", "backend": "local", "path": "missing_graph.json"}
+        ]
+
+    def test_create_fail_on_skip_exits_nonzero_without_writing(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_records_no_skipped_entries_when_paths_exist(self, runner):
+        # A store the caller simply has not configured is not a skip, and a
+        # backend with no local path key (cloud) must not be reported either.
+        with runner.isolated_filesystem():
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: kg\n"
+                    "vector_store:\n"
+                    "  backend: pinecone\n"
+                    "  index: demo\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            assert "Skipping" not in _flatten(result.output)
+            with tarfile.open("out.tar.gz") as tar:
+                manifest = json.loads(
+                    tar.extractfile("semantica-backup/backup_manifest.json").read()
+                )
+        assert manifest["skipped"] == []
+
+    def test_collect_backup_sources_separates_missing_paths(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "graph_db": {"backend": "local", "path": "gone.json"},
+                "vector_store": {"backend": "local", "path": "vecs"},
+                "triplet_store": {"backend": "pinecone", "index": "demo"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert skipped == [
+            {"store": "graph", "backend": "local", "path": "gone.json"}
+        ]
+
     def test_create_dry_run_json(self, runner):
         # backup create has no per-command --json; use global --json
         result = runner.invoke(cli_module.main, ["--json", "backup", "create", "backup.tar.gz",
