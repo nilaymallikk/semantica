@@ -3257,6 +3257,127 @@ class TestBackup:
             {"store": "graph", "backend": "local", "path": "gone.json"}
         ]
 
+    @pytest.mark.parametrize("extra_args", [[], ["--fail-on-skip"]])
+    def test_create_names_every_missing_store_when_none_exist(self, runner, extra_args):
+        # When every configured store path is missing, the empty-archive error
+        # (#1820) still fires, but each missing path must be named first.
+        with runner.isolated_filesystem():
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: missing_vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", *extra_args],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "missing_graph.json" in flat
+            assert "Skipping vector store" in flat
+            assert "missing_vecs" in flat
+            assert "No store data to back up" in flat
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_without_store_config_reports_no_skip(self, runner):
+        # No store configured at all is the #1820 case, not a skip.
+        with runner.isolated_filesystem():
+            with open("cfg.yaml", "w") as f:
+                f.write("processing:\n  batch_size: 8\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "No store data to back up" in flat
+            assert "Skipping" not in flat
+
+    def test_create_redacts_credentials_in_skipped_path(self, runner):
+        # A credential-bearing path must not reach the warning or the
+        # manifest, even with --strip-config.
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: 'postgresql://user:s3cretpw@db.example/kg'\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            assert "s3cretpw" not in result.output
+            assert "Skipping graph store" in _flatten(result.output)
+            with tarfile.open("out.tar.gz") as tar:
+                raw = tar.extractfile(
+                    "semantica-backup/backup_manifest.json"
+                ).read().decode("utf-8")
+        assert "s3cretpw" not in raw
+        manifest = json.loads(raw)
+        assert len(manifest["skipped"]) == 1
+        assert manifest["skipped"][0]["path"].startswith("postgresql://user:")
+        assert manifest["skipped"][0]["path"].endswith("@db.example/kg")
+
+    def test_create_fail_on_skip_redacts_credentials(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: 'postgresql://user:s3cretpw@db.example/kg'\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert "s3cretpw" not in result.output
+            assert not os.path.exists("out.tar.gz")
+
+    def test_collect_backup_sources_redacts_but_checks_the_real_path(self, runner):
+        # The redacted form is only for reporting; an existing path containing
+        # ":...@" must still be found and archived under its real name.
+        with runner.isolated_filesystem():
+            os.makedirs("a:b@c")
+            with open("a:b@c/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "graph_db": {"backend": "sqlite",
+                             "path": "postgresql://user:s3cretpw@db.example/kg"},
+                "vector_store": {"backend": "local", "path": "a:b@c"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert [str(p) for _, p in sources] == [os.path.join("a:b@c", "index.json")]
+        assert len(skipped) == 1
+        assert "s3cretpw" not in skipped[0]["path"]
+
     def test_create_dry_run_json(self, runner):
         # backup create has no per-command --json; use global --json
         result = runner.invoke(cli_module.main, ["--json", "backup", "create", "backup.tar.gz",

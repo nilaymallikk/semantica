@@ -5319,10 +5319,12 @@ def _collect_backup_sources(
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
         else:
+            # Redacted: this is shown in a warning and written to the
+            # manifest, even with --strip-config.
             skipped.append({
                 "store": store_type,
                 "backend": str(info.get("backend", "unknown")),
-                "path": data_path,
+                "path": _redact(data_path),
             })
 
     return sources, skipped
@@ -5443,6 +5445,17 @@ def backup_create(
         sources, skipped = _collect_backup_sources(
             cfg, cli_ctx.config_path, include, strip_config,
         )
+        # A configured store whose path is missing was dropped without a word,
+        # so a partial archive was reported as a success (#2009). Report every
+        # one before the prompts, and before the empty-archive check below so
+        # the missing paths are named even when no store is left to back up.
+        for entry in skipped:
+            _warn(
+                cli_ctx,
+                f"Skipping {entry['store']} store ({entry['backend']}): "
+                f"path does not exist: {entry['path']}",
+            )
+
         # Fail before any prompt instead of writing an archive with no
         # store data in it (#1820).
         if include in ("graph", "vector", "triplet", "all") and not any(
@@ -5457,15 +5470,6 @@ def backup_create(
                 "to see how to back up other backends."
             )
 
-        # A configured store whose path is missing was dropped without a word,
-        # so a partial archive was reported as a success (#2009). Report every
-        # one before the prompts rather than after the archive is written.
-        for entry in skipped:
-            _warn(
-                cli_ctx,
-                f"Skipping {entry['store']} store ({entry['backend']}): "
-                f"path does not exist: {entry['path']}",
-            )
         if skipped and fail_on_skip:
             missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
             raise click.ClickException(
